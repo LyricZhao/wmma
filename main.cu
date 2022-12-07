@@ -141,8 +141,9 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
         // Iterate over chunks
         #pragma unroll
         for (unsigned int tk = 0; tk < K_TILES; tk += K_CHUNK_TILES) {
+            // Load A and B into shared memory
             #pragma unroll
-            for (unsigned int i = 0; i < K_CHUNK_TILES; ++ i) {
+            for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
                 // Load A (BLOCK_TILE_ROWS x 1) into shared memory using 8 warps
                 // Each warp is responsible for a warp row
                 assert(BLOCK_TILE_ROWS == WARPS_PER_CTA);
@@ -152,15 +153,15 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
                 if (laneId < HALF_THREADS_PER_WARP) {
                     // Copy the 16x16 matrix with 16 threads for A
                     assert(HALF_THREADS_PER_WARP == WMMA_M);
-                    ei = (ti + warpId) * WMMA_M, ej = (tk + i) * WMMA_K;
-                    eiShared = warpId * WMMA_M, ejShared = i * WMMA_K;
+                    ei = (ti + warpId) * WMMA_M, ej = (tk + chunk) * WMMA_K;
+                    eiShared = warpId * WMMA_M, ejShared = chunk * WMMA_K;
                     stride = A_GLOBAL_STRIDE, strideShared = A_SHARED_STRIDE;
                     dst = sharedA, src = A;
                 } else {
                     // Copy the 16x16 matrix with 16 threads for B
                     assert(HALF_THREADS_PER_WARP == WMMA_N);
-                    ei = (tj + warpId) * WMMA_N, ej = (tk + i) * WMMA_K;
-                    eiShared = warpId * WMMA_N, ejShared = i * WMMA_K;
+                    ei = (tj + warpId) * WMMA_N, ej = (tk + chunk) * WMMA_K;
+                    eiShared = warpId * WMMA_N, ejShared = chunk * WMMA_K;
                     stride = B_GLOBAL_STRIDE, strideShared = B_SHARED_STRIDE;
                     dst = sharedB, src = B;
                 }
@@ -168,7 +169,36 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
                 for (unsigned int copy = 0; copy < WMMA_K; ++ copy)
                     dst[(eiShared + laneId) * strideShared + ejShared + copy] = src[(ei + laneId) * stride + ej + copy];
             }
+            __syncthreads();
+
+            // Compute and store into C fragments
+            #pragma unroll
+            for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
+                // Load A from shared memory to fragments
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragA[WARP_TILE_ROWS];
+                #pragma unroll
+                for (int i = 0; i < WARP_TILE_ROWS; ++ i)
+                    wmma::load_matrix_sync(fragA[i], sharedA + wi * WARP_TILE_ROWS * WMMA_M * A_SHARED_STRIDE + (tk + chunk) * WMMA_K, A_SHARED_STRIDE);
+
+                // Load B from shared memory to fragments
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> fragB[WARP_TILE_COLS];
+                #pragma unroll
+                for (int j = 0; j < WARP_TILE_COLS; ++ j)
+                    wmma::load_matrix_sync(fragB[j], sharedB + wj * WARP_TILE_COLS * WMMA_N * B_SHARED_STRIDE + (tk + chunk) * WMMA_K, B_SHARED_STRIDE);
+
+                // Multiply and accumulate into C fragments
+                #pragma unroll
+                for (int i = 0; i < WARP_TILE_ROWS; ++ i) {
+                    #pragma unroll
+                    for (int j = 0; j < WARP_TILE_COLS; ++ j)
+                        wmma::mma_sync(fragC[i][j], fragA[i], fragB[j], fragC[i][j]);
+                }
+            }
+            __syncthreads();
         }
+
+        // TODO: scale and store into D
+        __syncthreads();
     }
 }
 
@@ -219,7 +249,7 @@ int main(int argc, const char **argv) {
     checkCudaErrors(cudaEventRecord(start));
 
     // Computation
-    // Each CTA computes one 128x128 tile of the resulting matrix, using 8 warps (TODO: why 8?)
+    // Each CTA computes one 128x128 tile of the resulting matrix, using 8 warps
     // Each warp computes eight 16x16 sub-tiles, organized in a 2x4 2D array.
     // Optimizations:
     // - The CTA copies the 128x128 tile of C from global to shared memory, so that each warp could load there
@@ -227,10 +257,7 @@ int main(int argc, const char **argv) {
     // - An additional padding to reduce bank conflicts
     // - The CTA stores into shared memory
     // Size of A and B, which are to be stored in shared memory
-    size_t sharedMemSize = std::max(
-        K_CHUNK_TILES * WARP_TILE_ROWS * (WMMA_M * WMMA_K + WMMA_K * WMMA_N) * sizeof(half),
-        BLOCK_TILE_ROWS * BLOCK_TILE_COLS * WMMA_M * WMMA_N * sizeof(float)
-    );
+    size_t sharedMemSize = K_CHUNK_TILES * (BLOCK_TILE_ROWS * WMMA_M * WMMA_K + BLOCK_TILE_COLS * WMMA_K * WMMA_N) * sizeof(half);
     printf("Required shared memory size: %zu KiB\n", sharedMemSize / 1024);
     printf("Computing ...\n");
     // <<<GridDim, BlockDim, SharedMemSize>>>
