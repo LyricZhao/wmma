@@ -6,11 +6,11 @@
 #include <mma.h>
 #include <random>
 
-#define HOST_VERIFY
+// #define HOST_VERIFY
 
 // Each CTA has 8 warps
 #define WARPS_PER_CTA 8
-#define HALF_WARPS_PER_CTA (WARPS_PER_CTA / 2)
+
 // Each warp has 32 threads
 #define THREADS_PER_WARP 32
 #define HALF_THREADS_PER_WARP (THREADS_PER_WARP / 2)
@@ -33,9 +33,9 @@
 #define WMMA_K 16
 
 // Matrix size
-#define M_GLOBAL 128
-#define N_GLOBAL 128
-#define K_GLOBAL 128
+#define M_GLOBAL 4096
+#define N_GLOBAL 4096
+#define K_GLOBAL 4096
 
 // The whole computation is divided into tiles
 #define M_TILES (M_GLOBAL / WMMA_M)
@@ -92,7 +92,7 @@ void verify(const half *hostA, const half *hostB, const float *hostC,
                 d += static_cast<float>(hostA[i * K_GLOBAL + k]) * static_cast<float>(hostB[j * K_GLOBAL + k]);
             d = d * alpha + hostC[i * N_GLOBAL + j] * beta;
             if (fabs(d - hostD[i * N_GLOBAL + j]) > 1e-1) {
-                printf("Verification failed, at (%d, %d): %f - %f\n", i, j, d, hostD[i * N_GLOBAL + j]);
+                printf("Verification failed, at (%d, %d): %f, %f\n", i, j, d, hostD[i * N_GLOBAL + j]);
                 std::exit(EXIT_FAILURE);
             }
         }
@@ -186,13 +186,13 @@ __global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float be
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragA[WARP_TILE_ROWS];
                 #pragma unroll
                 for (int i = 0; i < WARP_TILE_ROWS; ++ i)
-                    wmma::load_matrix_sync(fragA[i], sharedA + (wi * WARP_TILE_ROWS + i) * WMMA_M * A_SHARED_STRIDE + (tk + chunk) * WMMA_K, A_SHARED_STRIDE);
+                    wmma::load_matrix_sync(fragA[i], sharedA + (wi * WARP_TILE_ROWS + i) * WMMA_M * A_SHARED_STRIDE + chunk * WMMA_K, A_SHARED_STRIDE);
 
                 // Load B from shared memory to fragments
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> fragB[WARP_TILE_COLS];
                 #pragma unroll
                 for (int j = 0; j < WARP_TILE_COLS; ++ j)
-                    wmma::load_matrix_sync(fragB[j], sharedB + (wj * WARP_TILE_COLS + j) * WMMA_N * B_SHARED_STRIDE + (tk + chunk) * WMMA_K, B_SHARED_STRIDE);
+                    wmma::load_matrix_sync(fragB[j], sharedB + (wj * WARP_TILE_COLS + j) * WMMA_N * B_SHARED_STRIDE + chunk * WMMA_K, B_SHARED_STRIDE);
 
                 // Multiply and accumulate into C fragments
                 #pragma unroll
@@ -232,7 +232,7 @@ int main(int argc, const char **argv) {
     }
 
     // Problem specs
-    float alpha = 1.2, beta = 1.1;
+    float alpha = 1, beta = 1;
     printf("Problem specs:\n");
     printf("M: %d, N: %d, K: %d\n\n", M_GLOBAL, N_GLOBAL, K_GLOBAL);
 
