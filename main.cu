@@ -6,7 +6,7 @@
 #include <mma.h>
 #include <random>
 
-// #define HOST_VERIFY
+#define HOST_VERIFY
 
 // Each CTA has 8 warps
 #define WARPS_PER_CTA 8
@@ -33,9 +33,9 @@
 #define WMMA_K 16
 
 // Matrix size
-#define M_GLOBAL 4096
-#define N_GLOBAL 4096
-#define K_GLOBAL 4096
+#define M_GLOBAL 128
+#define N_GLOBAL 128
+#define K_GLOBAL 128
 
 // The whole computation is divided into tiles
 #define M_TILES (M_GLOBAL / WMMA_M)
@@ -55,6 +55,18 @@
 #define B_GLOBAL_STRIDE K_GLOBAL
 #define A_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K)
 #define B_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K)
+
+#define checkKernelErrors(expr)                             \
+  do {                                                      \
+    expr;                                                   \
+                                                            \
+    cudaError_t __err = cudaGetLastError();                 \
+    if (__err != cudaSuccess) {                             \
+      printf("Line %d: '%s' failed: %s\n", __LINE__, #expr, \
+             cudaGetErrorString(__err));                    \
+      abort();                                              \
+    }                                                       \
+  } while (0)
 
 
 void initHostMatrices(half* hostA, half *hostB, float *hostC) {
@@ -80,7 +92,7 @@ void verify(const half *hostA, const half *hostB, const float *hostC,
                 d += static_cast<float>(hostA[i * K_GLOBAL + k]) * static_cast<float>(hostB[j * K_GLOBAL + k]);
             d = d * alpha + hostC[i * N_GLOBAL + j] * beta;
             if (fabs(d - hostD[i * N_GLOBAL + j]) > 1e-1) {
-                printf("Verification failed, at (%d, %d)\n", i, j);
+                printf("Verification failed, at (%d, %d): %f - %f\n", i, j, d, hostD[i * N_GLOBAL + j]);
                 std::exit(EXIT_FAILURE);
             }
         }
@@ -89,20 +101,19 @@ void verify(const half *hostA, const half *hostB, const float *hostC,
 
 #endif
 
-__global__ void gemm(half *A, half *B, float *C, float *D,
-                     const float &alpha, const float& beta) {
+__global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float beta) {
     // Get the shared memory for saving A and B
     extern __shared__ half shmem[];
-    half *sharedA = shmem, *sharedB = shmem + K_CHUNK_TILES * WARP_TILE_ROWS * WMMA_M * WMMA_K;
+    half *sharedA = shmem, *sharedB = &shmem[K_CHUNK_TILES * BLOCK_TILE_ROWS * WMMA_M * WMMA_K];
 
     // Warp ID and lane ID
-    const unsigned int warpId = threadIdx.x / THREADS_PER_WARP;
-    const unsigned int laneId = threadIdx.x % THREADS_PER_WARP;
+    unsigned int warpId = threadIdx.x / THREADS_PER_WARP;
+    unsigned int laneId = threadIdx.x % THREADS_PER_WARP;
 
     // Warp indices inside the block
     // (0, 0), (0, 1)
     // (1, 0), (1, 1) ...
-    const unsigned int wi = warpId / BLOCK_WARP_COLS, wj = warpId % BLOCK_WARP_COLS;
+    unsigned int wi = warpId / BLOCK_WARP_COLS, wj = warpId % BLOCK_WARP_COLS;
 
     // Iterate over all 128x128 blocks (1024 blocks in total) with 82 SMs
     // SM1: 0, 82, 164, ...
@@ -118,9 +129,6 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
         // Global C's tile (the first one) indices
         const unsigned int cti = bi * BLOCK_TILE_ROWS + wi * WARP_TILE_ROWS, ctj = bj * BLOCK_TILE_COLS + wj * WARP_TILE_COLS;
 
-        // Global element (the first one) indices
-        const unsigned int cei = cti * WMMA_M, cej = ctj * WMMA_N;
-
         // Scale C matrix, D = alpha * (dot(A, B) + beta / alpha * C)
         float scale_factor = beta / alpha;
 
@@ -130,7 +138,7 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
         for (unsigned int i = 0; i < WARP_TILE_ROWS; ++ i) {
             #pragma unroll
             for (unsigned int j = 0; j < WARP_TILE_COLS; ++ j) {
-                wmma::load_matrix_sync(fragC[i][j], C + cei * N_GLOBAL + cej, N_GLOBAL, wmma::mem_row_major);
+                wmma::load_matrix_sync(fragC[i][j], C + (cti + i) * WMMA_M * N_GLOBAL + (ctj + j) * WMMA_N, N_GLOBAL, wmma::mem_row_major);
                 #pragma unroll
                 for (int k = 0; k < fragC[i][j].num_elements; ++ k)
                     fragC[i][j].x[k] *= scale_factor;
@@ -144,12 +152,12 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
             // Load A and B into shared memory
             #pragma unroll
             for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
-                // Load A (BLOCK_TILE_ROWS x 1) into shared memory using 8 warps
+                // Load A and B into shared memory using 8 warps
                 // Each warp is responsible for a warp row
                 assert(BLOCK_TILE_ROWS == WARPS_PER_CTA);
-                unsigned int ei = 0, ej = 0, eiShared = 0, ejShared = 0;
-                unsigned int stride = 0, strideShared = 0;
-                half *dst = nullptr, *src = nullptr;
+                unsigned int workerId = laneId % HALF_THREADS_PER_WARP;
+                unsigned int ei, ej, eiShared, ejShared, stride, strideShared;
+                half *dst, *src;
                 if (laneId < HALF_THREADS_PER_WARP) {
                     // Copy the 16x16 matrix with 16 threads for A
                     assert(HALF_THREADS_PER_WARP == WMMA_M);
@@ -167,7 +175,7 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
                 }
                 #pragma unroll
                 for (unsigned int copy = 0; copy < WMMA_K; ++ copy)
-                    dst[(eiShared + laneId) * strideShared + ejShared + copy] = src[(ei + laneId) * stride + ej + copy];
+                    dst[(eiShared + workerId) * strideShared + ejShared + copy] = src[(ei + workerId) * stride + ej + copy];
             }
             __syncthreads();
 
@@ -178,13 +186,13 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> fragA[WARP_TILE_ROWS];
                 #pragma unroll
                 for (int i = 0; i < WARP_TILE_ROWS; ++ i)
-                    wmma::load_matrix_sync(fragA[i], sharedA + wi * WARP_TILE_ROWS * WMMA_M * A_SHARED_STRIDE + (tk + chunk) * WMMA_K, A_SHARED_STRIDE);
+                    wmma::load_matrix_sync(fragA[i], sharedA + (wi * WARP_TILE_ROWS + i) * WMMA_M * A_SHARED_STRIDE + (tk + chunk) * WMMA_K, A_SHARED_STRIDE);
 
                 // Load B from shared memory to fragments
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> fragB[WARP_TILE_COLS];
                 #pragma unroll
                 for (int j = 0; j < WARP_TILE_COLS; ++ j)
-                    wmma::load_matrix_sync(fragB[j], sharedB + wj * WARP_TILE_COLS * WMMA_N * B_SHARED_STRIDE + (tk + chunk) * WMMA_K, B_SHARED_STRIDE);
+                    wmma::load_matrix_sync(fragB[j], sharedB + (wj * WARP_TILE_COLS + j) * WMMA_N * B_SHARED_STRIDE + (tk + chunk) * WMMA_K, B_SHARED_STRIDE);
 
                 // Multiply and accumulate into C fragments
                 #pragma unroll
@@ -197,7 +205,17 @@ __global__ void gemm(half *A, half *B, float *C, float *D,
             __syncthreads();
         }
 
-        // TODO: scale and store into D
+        // Scale and store into D
+        #pragma unroll
+        for (unsigned int i = 0; i < WARP_TILE_ROWS; ++ i) {
+            #pragma unroll
+            for (unsigned int j = 0; j < WARP_TILE_COLS; ++ j) {
+                #pragma unroll
+                for (int k = 0; k < fragC[i][j].num_elements; ++ k)
+                    fragC[i][j].x[k] *= alpha;
+                wmma::store_matrix_sync(D + (cti + i) * WMMA_M * N_GLOBAL + (ctj + j) * WMMA_N, fragC[i][j], N_GLOBAL, wmma::mem_row_major);
+            }
+        }
         __syncthreads();
     }
 }
@@ -214,7 +232,7 @@ int main(int argc, const char **argv) {
     }
 
     // Problem specs
-    float alpha = 1.1, beta = 1.2;
+    float alpha = 1.2, beta = 1.1;
     printf("Problem specs:\n");
     printf("M: %d, N: %d, K: %d\n\n", M_GLOBAL, N_GLOBAL, K_GLOBAL);
 
@@ -242,13 +260,6 @@ int main(int argc, const char **argv) {
     checkCudaErrors(cudaMemcpy(C, hostC, sizeof(float) * M_GLOBAL * N_GLOBAL, cudaMemcpyHostToDevice));
     checkCudaErrors(cudaMemset(D, 0, sizeof(float) * M_GLOBAL * N_GLOBAL));
 
-    // Timer starts
-    cudaEvent_t start, stop;
-    checkCudaErrors(cudaEventCreate(&start));
-    checkCudaErrors(cudaEventCreate(&stop));
-    checkCudaErrors(cudaEventRecord(start));
-
-    // Computation
     // Each CTA computes one 128x128 tile of the resulting matrix, using 8 warps
     // Each warp computes eight 16x16 sub-tiles, organized in a 2x4 2D array.
     // Optimizations:
@@ -258,10 +269,25 @@ int main(int argc, const char **argv) {
     // - The CTA stores into shared memory
     // Size of A and B, which are to be stored in shared memory
     size_t sharedMemSize = K_CHUNK_TILES * (BLOCK_TILE_ROWS * WMMA_M * WMMA_K + BLOCK_TILE_COLS * WMMA_K * WMMA_N) * sizeof(half);
+    printf("Hardware specs:\n");
+    printf("Device shared memory per SM: %zu KiB\n", deviceProp.sharedMemPerMultiprocessor / 1024);
     printf("Required shared memory size: %zu KiB\n", sharedMemSize / 1024);
+    printf("SM count: %d\n", deviceProp.multiProcessorCount);
+    printf("Threads per CTA: %d\n\n", WARPS_PER_CTA * THREADS_PER_WARP);
+
+    // Timer starts
+    cudaEvent_t start, stop;
+    checkCudaErrors(cudaEventCreate(&start));
+    checkCudaErrors(cudaEventCreate(&stop));
+    checkCudaErrors(cudaEventRecord(start));
+
+    // Computation
     printf("Computing ...\n");
     // <<<GridDim, BlockDim, SharedMemSize>>>
-    gemm<<<deviceProp.multiProcessorCount, WARPS_PER_CTA * THREADS_PER_WARP, sharedMemSize>>>(A, B, C, D, alpha, beta);
+    checkCudaErrors(cudaFuncSetAttribute(gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize));
+    checkKernelErrors((
+        gemm<<<deviceProp.multiProcessorCount, WARPS_PER_CTA * THREADS_PER_WARP, sharedMemSize>>>(A, B, C, D, alpha, beta)
+    ));
 
     // Timer stops
     float milliseconds = 0;
