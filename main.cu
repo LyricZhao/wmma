@@ -50,11 +50,14 @@
 // The stride while iterating over K dimension
 #define K_CHUNK_TILES 8
 
+// Padding to avoid bank conflicts
+#define SKEW_HALF 16
+
 // Strides
 #define A_GLOBAL_STRIDE K_GLOBAL
 #define B_GLOBAL_STRIDE K_GLOBAL
-#define A_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K)
-#define B_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K)
+#define A_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K + SKEW_HALF)
+#define B_SHARED_STRIDE (K_CHUNK_TILES * WMMA_K + SKEW_HALF)
 
 #define checkKernelErrors(expr)                             \
   do {                                                      \
@@ -104,7 +107,7 @@ void verify(const half *hostA, const half *hostB, const float *hostC,
 __global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float beta) {
     // Get the shared memory for saving A and B
     extern __shared__ half shmem[];
-    half *sharedA = shmem, *sharedB = &shmem[K_CHUNK_TILES * BLOCK_TILE_ROWS * WMMA_M * WMMA_K];
+    half *sharedA = shmem, *sharedB = &shmem[BLOCK_TILE_ROWS * WMMA_M * (K_CHUNK_TILES * WMMA_K + SKEW_HALF)];
 
     // Warp ID and lane ID
     unsigned int warpId = threadIdx.x / THREADS_PER_WARP;
@@ -150,31 +153,26 @@ __global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float be
         // Iterate over chunks
         #pragma unroll
         for (unsigned int tk = 0; tk < K_TILES; tk += K_CHUNK_TILES) {
-            // Load A and B into shared memory using 8 warps
-            // Each warp is responsible for a warp row
-            // 16 rows, 16 half per row (32 bytes, 2 x int4)
-            assert(BLOCK_TILE_ROWS == WARPS_PER_CTA);
-            assert(THREADS_PER_WARP == 32);
-            int4 *int4Src, *int4Dst;
-
-            // NOTE:
-            // Id: 0, 1, 2, 3, 4, ... 16, ..., 31
-            // M1: 0, 0, 0, 0, 0, ...  1, ...,  1 (correct)
-            // W1: 0, 1, 2, 3, 4, ...  0, ..., 15
-            // M2: 0, 1, 0, 1, 0, ...  0, ...,  1 (wrong)
-            // W2: 0, 0, 1, 1, 2, ...  8, ..., 15
-
-            // Load A
-            int4Src = reinterpret_cast<int4*>(A + ((ti + warpId) * WMMA_M + workerId) * A_GLOBAL_STRIDE + tk * WMMA_K) + (workerGroupId ? 8 : 0);
-            int4Dst = reinterpret_cast<int4*>(sharedA + (warpId * WMMA_M + workerId) * A_SHARED_STRIDE) + (workerGroupId ? 8 : 0);
-            int4Dst[0] = int4Src[0], int4Dst[1] = int4Src[1], int4Dst[2] = int4Src[2], int4Dst[3] = int4Src[3];
-            int4Dst[4] = int4Src[4], int4Dst[5] = int4Src[5], int4Dst[6] = int4Src[6], int4Dst[7] = int4Src[7];
-
-            // Load B
-            int4Src = reinterpret_cast<int4*>(B + ((tj + warpId) * WMMA_N + workerId) * B_GLOBAL_STRIDE + tk * WMMA_K) + (workerGroupId ? 8 : 0);
-            int4Dst = reinterpret_cast<int4*>(sharedB + (warpId * WMMA_N + workerId) * B_SHARED_STRIDE) + (workerGroupId ? 8 : 0);
-            int4Dst[0] = int4Src[0], int4Dst[1] = int4Src[1], int4Dst[2] = int4Src[2], int4Dst[3] = int4Src[3];
-            int4Dst[4] = int4Src[4], int4Dst[5] = int4Src[5], int4Dst[6] = int4Src[6], int4Dst[7] = int4Src[7];
+            // Load A and B into shared memory
+            #pragma unroll
+            for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
+                // Load A and B into shared memory using 8 warps
+                // Each warp is responsible for a warp row
+                assert(BLOCK_TILE_ROWS == WARPS_PER_CTA);
+                int4 *int4Src, *int4Dst;
+                if (laneId < HALF_THREADS_PER_WARP) {
+                    // Copy the 16x16 matrix with 16 threads for A
+                    assert(HALF_THREADS_PER_WARP == WMMA_M);
+                    int4Src = reinterpret_cast<int4*>(A + ((ti + warpId) * WMMA_M + workerId) * A_GLOBAL_STRIDE + (tk + chunk) * WMMA_K);
+                    int4Dst = reinterpret_cast<int4*>(sharedA + (warpId * WMMA_M + workerId) * A_SHARED_STRIDE + chunk * WMMA_K);
+                } else {
+                    // Copy the 16x16 matrix with 16 threads for B
+                    assert(HALF_THREADS_PER_WARP == WMMA_N);
+                    int4Src = reinterpret_cast<int4*>(B + ((tj + warpId) * WMMA_N + workerId) * B_GLOBAL_STRIDE + (tk + chunk) * WMMA_K);
+                    int4Dst = reinterpret_cast<int4*>(sharedB + (warpId * WMMA_N + workerId) * B_SHARED_STRIDE + chunk * WMMA_K);
+                }
+                int4Dst[0] = int4Src[0], int4Dst[1] = int4Src[1];
+            }
             __syncthreads();
 
             // Compute and store into C fragments
@@ -264,7 +262,9 @@ int main(int argc, const char **argv) {
     // - An additional padding to reduce bank conflicts
     // - The CTA stores into shared memory
     // Size of A and B, which are to be stored in shared memory
-    size_t sharedMemSize = K_CHUNK_TILES * (BLOCK_TILE_ROWS * WMMA_M * WMMA_K + BLOCK_TILE_COLS * WMMA_K * WMMA_N) * sizeof(half);
+    size_t sharedMemSize = 0;
+    sharedMemSize += BLOCK_TILE_ROWS * WMMA_M * (K_CHUNK_TILES * WMMA_K + SKEW_HALF) * sizeof(half);
+    sharedMemSize += BLOCK_TILE_ROWS * WMMA_N * (K_CHUNK_TILES * WMMA_K + SKEW_HALF) * sizeof(half);
     printf("Hardware specs:\n");
     printf("Device shared memory per SM: %zu KiB\n", deviceProp.sharedMemPerMultiprocessor / 1024);
     printf("Required shared memory size: %zu KiB\n", sharedMemSize / 1024);
