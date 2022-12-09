@@ -13,7 +13,6 @@
 
 // Each warp has 32 threads
 #define THREADS_PER_WARP 32
-#define HALF_THREADS_PER_WARP (THREADS_PER_WARP / 2)
 
 // Each block is divided into a 4x2 warp array
 #define BLOCK_WARP_ROWS 4
@@ -112,7 +111,7 @@ __global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float be
     // Warp ID and lane ID
     unsigned int warpId = threadIdx.x / THREADS_PER_WARP;
     unsigned int laneId = threadIdx.x % THREADS_PER_WARP;
-    unsigned int workerGroupId = laneId < HALF_THREADS_PER_WARP, workerId = laneId % HALF_THREADS_PER_WARP;
+    unsigned int workerGroupId = laneId & 1, workerId = laneId / 2;
 
     // Warp indices inside the block
     // (0, 0), (0, 1)
@@ -153,25 +152,25 @@ __global__ void gemm(half *A, half *B, float *C, float *D, float alpha, float be
         // Iterate over chunks
         #pragma unroll
         for (unsigned int tk = 0; tk < K_TILES; tk += K_CHUNK_TILES) {
-            // Load A and B into shared memory
+            // Load A and B into shared memory using 8 warps
+            // Each warp is responsible for a warp row
+            half *src, *dst;
+            src = A + ((ti + warpId) * WMMA_M + workerId) * A_GLOBAL_STRIDE + tk * WMMA_K;
+            dst = sharedA + (warpId * WMMA_M + workerId) * A_SHARED_STRIDE;
             #pragma unroll
             for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
-                // Load A and B into shared memory using 8 warps
-                // Each warp is responsible for a warp row
-                assert(BLOCK_TILE_ROWS == WARPS_PER_CTA);
-                int4 *int4Src, *int4Dst;
-                if (laneId < HALF_THREADS_PER_WARP) {
-                    // Copy the 16x16 matrix with 16 threads for A
-                    assert(HALF_THREADS_PER_WARP == WMMA_M);
-                    int4Src = reinterpret_cast<int4*>(A + ((ti + warpId) * WMMA_M + workerId) * A_GLOBAL_STRIDE + (tk + chunk) * WMMA_K);
-                    int4Dst = reinterpret_cast<int4*>(sharedA + (warpId * WMMA_M + workerId) * A_SHARED_STRIDE + chunk * WMMA_K);
-                } else {
-                    // Copy the 16x16 matrix with 16 threads for B
-                    assert(HALF_THREADS_PER_WARP == WMMA_N);
-                    int4Src = reinterpret_cast<int4*>(B + ((tj + warpId) * WMMA_N + workerId) * B_GLOBAL_STRIDE + (tk + chunk) * WMMA_K);
-                    int4Dst = reinterpret_cast<int4*>(sharedB + (warpId * WMMA_N + workerId) * B_SHARED_STRIDE + chunk * WMMA_K);
-                }
-                int4Dst[0] = int4Src[0], int4Dst[1] = int4Src[1];
+                auto int4Src = reinterpret_cast<int4*>(src + chunk * WMMA_K);
+                auto int4Dst = reinterpret_cast<int4*>(dst + chunk * WMMA_K);
+                int4Dst[workerGroupId] = int4Src[workerGroupId];
+            }
+
+            src = B + ((tj + warpId) * WMMA_M + workerId) * B_GLOBAL_STRIDE + tk * WMMA_K;
+            dst = sharedB + (warpId * WMMA_M + workerId) * B_SHARED_STRIDE;
+            #pragma unroll
+            for (unsigned int chunk = 0; chunk < K_CHUNK_TILES; ++ chunk) {
+                auto int4Src = reinterpret_cast<int4*>(src + chunk * WMMA_K);
+                auto int4Dst = reinterpret_cast<int4*>(dst + chunk * WMMA_K);
+                int4Dst[workerGroupId] = int4Src[workerGroupId];
             }
             __syncthreads();
 
